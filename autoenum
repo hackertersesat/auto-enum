@@ -1,0 +1,20 @@
+# Dirsearch started Mon Oct 13 23:53:34 2025 as: /usr/lib/python3/dist-packages/dirsearch/dirsearch.py -u http://192.168.241.47:80/ -t 30 --format plain -o autoenum
+
+403   279B   http://192.168.241.47/.ht_wsr.txt
+403   279B   http://192.168.241.47/.htaccess.bak1
+403   279B   http://192.168.241.47/.htaccess.orig
+403   279B   http://192.168.241.47/.htaccess.save
+403   279B   http://192.168.241.47/.htaccess.sample
+403   279B   http://192.168.241.47/.htaccess_extra
+403   279B   http://192.168.241.47/.html
+403   279B   http://192.168.241.47/.htaccessOLD2
+403   279B   http://192.168.241.47/.htaccessOLD
+403   279B   http://192.168.241.47/.htm
+403   279B   http://192.168.241.47/.htaccess_orig
+403   279B   http://192.168.241.47/.htaccess_sc
+403   279B   http://192.168.241.47/.htaccessBAK
+403   279B   http://192.168.241.47/.htpasswds
+403   279B   http://192.168.241.47/.httr-oauth
+403   279B   http://192.168.241.47/.htpasswd_test
+403   279B   http://192.168.241.47/server-status
+403   279B   http://192.168.241.47/server-status/
