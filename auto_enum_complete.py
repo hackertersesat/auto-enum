@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-import argparse, os, re, shutil, subprocess, sys, json, time, tempfile
+import argparse, os, shutil, subprocess, sys, json, time, tempfile
 import html as _html
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote as _urlq
 import mimetypes
-import re
 import types
 import xml.etree.ElementTree as ET
 import threading
 import itertools
 import contextlib
+import re
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -100,6 +100,32 @@ def _file_info(path: Path):
     except Exception:
         return 0, ""
 
+# ---------- Low-noise whitelist for report ----------
+_ALLOWED_FILES = {
+    "nmap":      (lambda p: p.suffix == ".nmap"),  # only .nmap
+    "smb":       (lambda p: p.name in {"smbmap_anonymous.txt", "enum4linux-ng.txt", "enum4linux.txt", "smbclient_list.txt"}),
+    "ftp":       (lambda p: p.name in {"anonymous_list.txt", "nmap-ftp-scripts.txt"}),
+    "ldap":      (lambda p: p.name in {"ldap_base.txt"}),
+    "nfs":       (lambda p: p.name in {"exports.txt"}),
+    "redis":     (lambda p: p.name in {"info.txt", "config.txt"}),
+    "rpc":       (lambda p: p.name in {"rpcinfo.txt"}),
+    "ssh":       (lambda p: p.name in {"nmap-ssh.txt"}),
+    "smtp":      (lambda p: p.name in {"nmap-smtp.txt"}),
+    # http_* folders: filtered in generate_html_report()
+}
+def _allowed_in_section(section_name: str, path: Path) -> bool:
+    # http_* files are filtered later so allow them through here
+    if section_name.startswith("http_"):
+        return True
+    for key, pred in _ALLOWED_FILES.items():
+        if section_name == key:
+            return pred(path)
+    # default: keep text-ish files up to 500KB
+    try:
+        return _is_probably_text(path) and path.stat().st_size <= 500*1024
+    except Exception:
+        return False
+
 def _collect_artifacts(ip_dir: Path, ip: str):
     buckets = []
     for item in sorted(ip_dir.iterdir()):
@@ -111,6 +137,8 @@ def _collect_artifacts(ip_dir: Path, ip: str):
         files = []
         for p in sorted(item.rglob("*")):
             if p.is_file():
+                if not _allowed_in_section(name, p):
+                    continue
                 size, mtime = _file_info(p)
                 rel = p.relative_to(ip_dir)
                 files.append({
@@ -170,6 +198,99 @@ def _categorize_tasks_easy_to_hard(state, limit_each=8):
         tiers[k] = tiers[k][:limit_each]
     return tiers
 
+# ---------- New: Summary table HTML ----------
+def _summary_table_html(port_summary: dict):
+    # port_summary is {(port, proto): service}
+    tcp = [(p, svc) for (p, pr), svc in (port_summary or {}).items() if pr == "tcp"]
+    udp = [(p, svc) for (p, pr), svc in (port_summary or {}).items() if pr == "udp"]
+    tcp.sort(); udp.sort()
+
+    def _rows(rows, proto):
+        return "".join(f"<tr><td>{p}/{proto}</td><td>{_escape(svc) or '—'}</td></tr>" for p, svc in rows) or "<tr><td colspan='2' class='muted'>—</td></tr>"
+
+    return f"""
+<div class="card">
+  <h2>Summary</h2>
+  <div class="grid cols-2">
+    <div>
+      <h3>Open TCP</h3>
+      <table class="files"><thead><tr><th>Port</th><th>Service</th></tr></thead>
+      <tbody>{_rows(tcp, 'tcp')}</tbody></table>
+    </div>
+    <div>
+      <h3>Open UDP</h3>
+      <table class="files"><thead><tr><th>Port</th><th>Service</th></tr></thead>
+      <tbody>{_rows(udp, 'udp')}</tbody></table>
+    </div>
+  </div>
+</div>
+"""
+
+# ---------- New: Exploits table from TSV (only versioned rows) ----------
+def _exploits_table_html(ip_dir: Path, limit=30):
+    tsv = ip_dir / "exploits" / "searchsploit_from_nmap.tsv"
+    if not tsv.exists():
+        return """
+<div class="card"><h2>Exploits</h2><p class="muted">No exploits data.</p></div>"""
+
+    rows = []
+    with open(tsv, "r", encoding="utf-8", errors="ignore") as f:
+        # header: Service\tVersion\tHTTP_Title\tHTTP_Server\tKeyword\tTitle\tURL\tEDB_ID
+        next(f, None)
+        for ln in f:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) < 8:
+                continue
+            svc, ver, htitle, hserver, kw, title, url, edb = parts
+            if (ver or "").strip():   # only keep versioned (potential) findings
+                rows.append((svc, ver, title, url, edb))
+
+    if not rows:
+        return """
+<div class="card"><h2>Exploits</h2><p class="muted">No version-matched exploits.</p></div>"""
+
+    rows = rows[:limit]
+    body = "".join(
+        f"<tr><td>{_escape(svc or '—')}</td>"
+        f"<td>{_escape(ver or '—')}</td>"
+        f"<td><a target='_blank' href='{_escape(url)}'>{_escape(title)}</a></td>"
+        f"<td>{_escape(edb or '—')}</td></tr>"
+        for (svc, ver, title, url, edb) in rows
+    )
+    return f"""
+<div class="card">
+  <h2>Potential Exploits <span class='pill'>{len(rows)}</span></h2>
+  <div class="files">
+    <table>
+      <thead><tr><th>Service</th><th>Version</th><th>Title</th><th>EDB</th></tr></thead>
+      <tbody>{body}</tbody>
+    </table>
+  </div>
+</div>
+"""
+
+# ---------- New: dirsearch report resolver ----------
+def _dirsearch_report_for(ip: str, port: int, http_dir: Path):
+    # 1) Prefer the "Output File:" path inside dirsearch.log
+    log_txt = read_text(http_dir / "dirsearch.log")
+    m = re.search(r"Output File:\s*(/[^ \t\r\n]+)", log_txt)
+    if m:
+        base = Path(m.group(1).strip())
+        for ext in (".txt", ".html"):
+            p = base.with_suffix(ext)
+            if p.exists():
+                return p
+
+    # 2) Fallback: scan known dirsearch reports roots
+    candidates = []
+    for root in (Path.home() / "dirsearch" / "reports", Path.cwd() / "reports"):
+        if root.exists():
+            for p in root.rglob(f"*{ip}_{port}*"):
+                if p.suffix in (".txt", ".html"):
+                    candidates.append(p)
+    candidates.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    return candidates[0] if candidates else None
+
 def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary: dict | None = None):
     # Mind-map (raw, unescaped)
     planner_dir = ip_dir / "planner"
@@ -180,8 +301,7 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
 
     artifacts = _collect_artifacts(ip_dir, ip)
     
-    # Build exploit table removed per request — we no longer render Searchsploit output here.
-    # Follow-ups (non-empty only), for the top table
+    # Build follow-ups (non-empty only), for the top table (kept minimal)
     followups = []
     for sec in artifacts:
         for f in sec["files"]:
@@ -190,7 +310,7 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
     followups.sort(key=lambda x: -x[1]["size"])
     followups_top = followups[:20]
 
-    # Port summary
+    # Port summary lists
     open_tcp, open_udp = [], []
     if port_summary:
         for (p, proto), svc in sorted(port_summary.items()):
@@ -237,44 +357,29 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
 </style>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({{ startOnLoad: true, theme: "dark" }});</script>
-<script>
-function expandAll() {{
-  document.querySelectorAll('details').forEach(d => d.open = true);
-}}
-function collapseAll() {{
-  document.querySelectorAll('details').forEach(d => d.open = false);
-}}
-</script>
 </head>
 <body>
 <div class="wrap">
 """
 
+    # Header + Summary (table)
+    summary_html = _summary_table_html(port_summary or {})
+
     header = f"""
 <h1>AutoEnum Report – {_escape(ip)}</h1>
 <p class="muted">Generated: {datetime.now(timezone.utc).isoformat()}</p>
+"""
 
-<div class="card">
-  <h2>Summary</h2>
-  <div class="grid cols-2">
-    <div>
-      <h3>Open TCP</h3>
-      <pre>{_escape("\\n".join(open_tcp) or "—")}</pre>
-    </div>
-    <div>
-      <h3>Open UDP</h3>
-      <pre>{_escape("\\n".join(open_udp) or "—")}</pre>
-    </div>
-  </div>
-</div>
-
+    mindmap_html = f"""
 <div class="card">
   <h2>Mind-Map</h2>
   <pre class="mermaid">
 {mm_src}
   </pre>
 </div>
+"""
 
+    next_actions_html = f"""
 <div class="card">
   <h2>Next actions (easy → hard)</h2>
   <div class="grid cols-2">
@@ -298,7 +403,10 @@ function collapseAll() {{
 </div>
 """
 
-    # Follow-ups with content (top)
+    # Potential exploits (from TSV, version-matched)
+    exploits_html = _exploits_table_html(ip_dir)
+
+    # Follow-ups with content (top) — unchanged but benefits from whitelist
     if followups_top:
         rows = []
         for folder, f in followups_top:
@@ -323,12 +431,11 @@ function collapseAll() {{
 </div>
 """
 
-    # Full artifacts with embedded text
+    # Full artifacts with embedded text (filtered)
     sections = []
     sections.append("""
 <div class="btnbar">
-  <button class="btn" onclick="expandAll()">Expand all</button>
-  <button class="btn" onclick="collapseAll()">Collapse all</button>
+  <span class="muted">Sections below are trimmed to low-hanging fruit.</span>
 </div>
 """)
     for sec in artifacts:
@@ -352,7 +459,6 @@ function collapseAll() {{
                 link_http = f"http://{folder_ip}:{folder_port}/"
                 link_https = f"https://{folder_ip}:{folder_port}/"
 
-                # use _escape to HTML-escape the URL (safe for href), but don't url-quote it
                 launch_html = (
                     "<span class=\"launch-links\">"
                     f"<a href=\"{_escape(link_http)}\" target=\"_blank\" rel=\"noopener\">Open (http)</a>"
@@ -360,24 +466,83 @@ function collapseAll() {{
                     "</span>"
                 )
 
-        for f in sec["files"]:
-            size = f["size"]
-            size_k = max(1, size // 1024)
-            rel = f["rel"]
-            name = f["name"]
-            mtime = f["mtime"]
-            badge = " <span class='pill'>follow-up</span>" if f["is_followup"] else ""
-            # Only embed text-like files; always provide a link
-            body_html = "<p class='muted'>Binary or non-text file. <a href='{0}' target='_blank'>Open raw</a>.</p>".format(_urlq(rel))
-            if _is_probably_text(Path(f["path"])):
-                text, truncated = _read_text_for_embed(Path(f["path"]))
-                body_html = f"<pre>{_escape(text)}</pre>"
-                if truncated:
-                    body_html = f"<div class='muted'>(preview truncated to 200 KB)</div>" + body_html
-            # Render details
-            blocks.append(f"""
+        # HTTP section: only keep whatweb, curl headers, nmap-http-scripts + dirsearch report
+        if sec["folder"].startswith("http_"):
+            parts = sec["folder"].split("_")
+            folder_ip = parts[1] if len(parts) > 1 else ip
+            folder_port = parts[2] if len(parts) > 2 else "80"
+
+            # Add dirsearch report (external) first
+            ds_report = _dirsearch_report_for(folder_ip, int(folder_port), Path(ip_dir)/sec["folder"])
+            if ds_report and ds_report.exists():
+                link = _escape(ds_report.as_posix())
+                if ds_report.suffix == ".txt":
+                    txt = read_text(ds_report)
+                    findings = []
+                    for ln in txt.splitlines():
+                        if re.search(r"\\b(200|204|301|302|307|401|403|405|500)\\b", ln) and "http" in ln:
+                            findings.append(ln)
+                    ds_body = "<pre>" + _escape("\\n".join(findings[:200]) or "(no findings)") + "</pre>"
+                else:
+                    ds_body = f"<p><a href='{link}' target='_blank' rel='noopener'>Open dirsearch HTML report</a></p>"
+
+                blocks.append(f"""
+<details open>
+  <summary>dirsearch report <span class='pill'>external</span>
+    <span class='right muted'><a href='{link}' target='_blank'>open report</a></span>
+  </summary>
+  {ds_body}
+</details>
+""")
+
+            # Now embed a small set of local files
+            keep_names = {"whatweb.txt", "curl-headers.txt", "nmap-http-scripts.txt"}
+            for f in sec["files"]:
+                name_lower = f["name"].lower()
+                if name_lower not in keep_names:
+                    continue
+                size = f["size"]
+                size_k = max(1, size // 1024)
+                rel = f["rel"]
+                mtime = f["mtime"]
+                badge = " <span class='pill'>follow-up</span>" if f["is_followup"] else ""
+
+                body_html = "<p class='muted'>Binary or non-text file. <a href='{0}' target='_blank'>Open raw</a>.</p>".format(_urlq(rel))
+                if _is_probably_text(Path(f["path"])):
+                    text, truncated = _read_text_for_embed(Path(f["path"]))
+                    # shorten whatweb a bit
+                    if name_lower == "whatweb.txt":
+                        lines = [ln for ln in text.splitlines() if ln.strip()]
+                        text = "\\n".join(lines[:120])
+                    body_html = f"<pre>{_escape(text)}</pre>"
+                    if truncated:
+                        body_html = f"<div class='muted'>(preview truncated to 200 KB)</div>" + body_html
+
+                blocks.append(f"""
 <details>
-  <summary>{_escape(name)}{badge}
+  <summary>{_escape(f['name'])}{badge}
+    <span class='right muted'>{size_k} KB • { _escape(mtime) } • <a href='{_urlq(rel)}' target='_blank'>open raw</a></span>
+  </summary>
+  {body_html}
+</details>
+""")
+        else:
+            # Non-HTTP sections already filtered by whitelist
+            for f in sec["files"]:
+                size = f["size"]
+                size_k = max(1, size // 1024)
+                rel = f["rel"]
+                mtime = f["mtime"]
+                badge = " <span class='pill'>follow-up</span>" if f["is_followup"] else ""
+                body_html = "<p class='muted'>Binary or non-text file. <a href='{0}' target='_blank'>Open raw</a>.</p>".format(_urlq(rel))
+                if _is_probably_text(Path(f["path"])):
+                    text, truncated = _read_text_for_embed(Path(f["path"]))
+                    body_html = f"<pre>{_escape(text)}</pre>"
+                    if truncated:
+                        body_html = f"<div class='muted'>(preview truncated to 200 KB)</div>" + body_html
+                blocks.append(f"""
+<details>
+  <summary>{_escape(f['name'])}{badge}
     <span class='right muted'>{size_k} KB • { _escape(mtime) } • <a href='{_urlq(rel)}' target='_blank'>open raw</a></span>
   </summary>
   {body_html}
@@ -387,7 +552,7 @@ function collapseAll() {{
         sections.append(f"""
 <div class="card">
   <h2>{_escape(sec["folder"])}{launch_html}</h2>
-  {''.join(blocks)}
+  {''.join(blocks) if blocks else "<p class='muted'>No low-hanging fruit artifacts.</p>"}
 </div>
 """)
 
@@ -397,7 +562,17 @@ function collapseAll() {{
 </html>
 """
 
-    final_html = html_head + header + followups_html + "".join(sections) + html_tail
+    final_html = (
+        html_head +
+        header +
+        summary_html +
+        mindmap_html +
+        next_actions_html +
+        exploits_html +
+        followups_html +
+        "".join(sections) +
+        html_tail
+    )
     out = ip_dir / "report.html"
     out.write_text(final_html, encoding="utf-8")
     note(f"Report written to: {out}")
@@ -491,9 +666,9 @@ def run(cmd, outfile=None, cwd=None, hard_timeout=None):
     elapsed = int(time.time() - start)
     return out, elapsed
 
-# =================== Nmap core (FAST: -T4 -A -p-, UDP only 69,161,162) ===================
+# =================== Nmap core (FAST: -T4 -A -p-, UDP controllable) ===================
 
-PORT_LINE = re.compile(r"(\S+)\s+Ports:\s+(.*)", re.I)
+PORT_LINE = re.compile(r"(\\S+)\\s+Ports:\\s+(.*)", re.I)
 
 def _sudo_prefix():
     try:
@@ -505,7 +680,7 @@ def nmap_stage_scans(ip, outdir, timing="T4", disable_ping=False, udp_top=200):
     """
     Fast profile:
       - One aggressive TCP sweep: nmap -T4 -A -p-  (sudo when possible)
-      - UDP: SNMP only (69, 162, 161) with -sU -sV
+      - UDP: configurable via --udp-top (top-N), else SNMP trio (69,161,162)
     """
     base = str(Path(outdir) / "nmap")
     Path(base).mkdir(parents=True, exist_ok=True)
@@ -521,15 +696,25 @@ def nmap_stage_scans(ip, outdir, timing="T4", disable_ping=False, udp_top=200):
     ]
     run(tcp_cmd, f"{alltcp}.runlog")
 
-    # UDP: SNMP only
-    udp = f"{base}/{ip}_udp_snmp"
-    note("Nmap UDP SNMP only (69, 162, 161)")
-    udp_cmd = _sudo_prefix() + [
-        "nmap", "-vv",
-        "-Pn" if disable_ping else "-PE",
-        "-sU", "-p", "69, 161, 162", "-sV",
-        "-oA", udp, ip
-    ]
+    # UDP: Top-N or SNMP trio
+    if udp_top and udp_top > 0:
+        udp = f"{base}/{ip}_udp_top{udp_top}"
+        note(f"Nmap UDP top-{udp_top}")
+        udp_cmd = _sudo_prefix() + [
+            "nmap", "-vv",
+            "-Pn" if disable_ping else "-PE",
+            "-sU", "--top-ports", str(udp_top), "-sV",
+            "-oA", udp, ip
+        ]
+    else:
+        udp = f"{base}/{ip}_udp_snmp"
+        note("Nmap UDP SNMP only (69, 161, 162)")
+        udp_cmd = _sudo_prefix() + [
+            "nmap", "-vv",
+            "-Pn" if disable_ping else "-PE",
+            "-sU", "-p", "69,161,162", "-sV",
+            "-oA", udp, ip
+        ]
     run(udp_cmd, f"{udp}.runlog")
 
     return {"top": None, "all": f"{alltcp}.gnmap", "all_xml": f"{alltcp}.xml", "udp": f"{udp}.gnmap", "udp_xml": f"{udp}.xml"}
@@ -562,7 +747,7 @@ def score_task(service, port, tactic):
     base = 50
     quick = {"banner":15,"version":15,"dirs":20,"default_creds":0,"anon":25,"scripts":10,
              "vuln_probe":20,"fetch":18,"smb_ls":22,"nfs_mount_ls":18,"ldap_base":18,
-             "grab":14,"headers":10,"rpcinfo":8,"snmp_walk":14,"redis_info":16}
+             "grab":14,"headers":10,"rpcinfo":8,"snmp_walk":14,"redis_info":16,"exports":12}
     svc_boost = {"http":15,"https":18,"smb":22,"ftp":14,"ssh":8,"ldap":14,"nfs":10,
                  "mysql":14,"mssql":14,"rdp":12,"redis":16,"rpc":8,"smtp":12,"snmp":10}
     port_boost = {80:10,443:12,445:15,21:8,22:6,389:8,2049:6,3306:8,1433:8,3389:8,6379:10,25:7,587:7,465:7,111:5}
@@ -607,11 +792,9 @@ def _json_sanitize(o):
     if isinstance(o, Path):
         return str(o)
     if isinstance(o, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
-        # show where it came from to aid debugging
         name = getattr(o, "__name__", "function")
         mod  = getattr(o, "__module__", "?")
         return f"<<function {mod}.{name}>>"
-    # last resort
     return str(o)
 
 def save_plan(ip_dir, state):
@@ -634,7 +817,6 @@ def load_plan(ip_dir):
         with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError:
-        # Backup the broken file and start fresh
         bad = p.with_suffix(".corrupt.json")
         try:
             shutil.copyfile(p, bad)
@@ -737,37 +919,13 @@ def http_enum(ip, port, outdir, wordlist, threads, scheme_hint=None, timebox=Non
         _,dt = run(["whatweb", "--color=never", "-a","3", base], d/"whatweb.txt", hard_timeout=timebox); out.append(f"whatweb:{dt}s")
     if which("dirsearch"):
         log_path = d / "dirsearch.log"
-        # v0.4.x supports --format plain and -o <name> (stored under dirsearch's own reports/)
-        # We set name 'autoenum' and then parse/copy the real path from stdout.
         _, dt = run(
             ["dirsearch", "-u", base, "-t", str(threads), "--format", "plain", "-o", "autoenum"],
             log_path,
             hard_timeout=timebox
         )
         out.append(f"dirsearch:{dt}s")
-
-        # Try to copy the generated plain report next to our artifacts
-        try:
-            log_txt = read_text(log_path)
-            # Example line emitted by dirsearch:
-            # "Output File: /home/kali/.../reports/http_192.168.x.x_80/__YY-MM-DD_HH-MM-SS.txt"
-            m = re.search(r"Output File:\s*(/[^ \t\r\n]+\.txt)", log_txt)
-            if m:
-                src = Path(m.group(1).strip())
-                if src.exists():
-                    shutil.copyfile(src, d / "dirsearch-report.txt")
-            # Fallback: if we didn't find a file, create a minimal “findings-only” view
-            if not (d / "dirsearch-report.txt").exists():
-                findings = []
-                for ln in log_txt.splitlines():
-                    # Keep lines that look like results (status code + URL), adjust as needed
-                    if re.search(r"\b(200|204|301|302|307|401|403|405|500)\b", ln) and "http" in ln:
-                        findings.append(ln)
-                if findings:
-                    (d / "dirsearch-report.txt").write_text("\n".join(findings) + "\n", encoding="utf-8")
-        except Exception as _e:
-            pass  # best-effort; you'll still have dirsearch.log embedded
-    
+        # We no longer try to copy the report; HTML renderer will resolve it from reports dir
     # content discovery
     if which("feroxbuster"):
         _,dt = run(["feroxbuster","-u",base,"-n","-t",str(threads),"-q"], d/"feroxbuster.txt", hard_timeout=timebox); out.append(f"ferox:{dt}s")
@@ -778,9 +936,9 @@ def http_enum(ip, port, outdir, wordlist, threads, scheme_hint=None, timebox=Non
     if which("nmap"):
         _,dt = run(["nmap","-Pn","-p",str(port),"--script","http-title,http-server-header,http-methods,http-headers,http-robots.txt",
                     "-oN", str(d/"nmap-http-scripts.txt"), ip], hard_timeout=timebox); out.append(f"nmap-http:{dt}s")
-    # basic header grab
+    # basic header grab (accept self-signed)
     if which("curl"):
-        _,dt = run(["curl","-I","--max-time","10",base], d/"curl-headers.txt", hard_timeout=timebox); out.append(f"curlH:{dt}s")
+        _,dt = run(["curl","-I","-k","--max-time","10",base], d/"curl-headers.txt", hard_timeout=timebox); out.append(f"curlH:{dt}s")
     return "; ".join(out) or "http:skipped"
 
 def smb_enum(ip, outdir, timebox=None):
@@ -857,26 +1015,23 @@ def read_text(p):
     except: return ""
 
 def find_http_paths(http_dir):
-    # parses feroxbuster/gobuster output for 200/301/302 lines and returns interesting paths
     hits=[]
     for name in ("feroxbuster.txt","gobuster.txt"):
         content = read_text(Path(http_dir)/name)
         for line in content.splitlines():
-            if re.search(r"\b(200|204|301|302|401|403)\b", line):
-                m = re.search(r"\s(/[^\s?#]+)", line)
+            if re.search(r"\\b(200|204|301|302|401|403)\\b", line):
+                m = re.search(r"\\s(/[^\\s?#]+)", line)
                 if m:
                     path = m.group(1)
                     if any(seg in path.lower() for seg in ("admin","login","upload",".git","server-status",".env","config","backup","console")):
                         hits.append(path)
-    # robots
     robots = read_text(Path(http_dir)/"nmap-http-scripts.txt")
-    for m in re.finditer(r"Disallowed:\s*(/[^\s]+)", robots):
+    for m in re.finditer(r"Disallowed:\\s*(/[^\\s]+)", robots):
         hits.append(m.group(1))
-    return list(dict.fromkeys(hits))  # unique, keep order
+    return list(dict.fromkeys(hits))
 
 def find_http_stack(http_dir):
-    # very light tech hints from whatweb/headers
-    s = (read_text(Path(http_dir)/"whatweb.txt") + "\n" + read_text(Path(http_dir)/"curl-headers.txt")).lower()
+    s = (read_text(Path(http_dir)/"whatweb.txt") + "\\n" + read_text(Path(http_dir)/"curl-headers.txt")).lower()
     hints=[]
     if "apache" in s: hints.append("apache")
     if "nginx" in s: hints.append("nginx")
@@ -888,35 +1043,32 @@ def find_http_stack(http_dir):
     return list(dict.fromkeys(hints))
 
 def find_smb_shares(smb_dir):
-    txt = read_text(Path(smb_dir)/"smbmap_anonymous.txt") + "\n" + read_text(Path(smb_dir)/"smbclient_list.txt")
+    txt = read_text(Path(smb_dir)/"smbmap_anonymous.txt") + "\\n" + read_text(Path(smb_dir)/"smbclient_list.txt")
     shares=set()
     for line in txt.splitlines():
-        m = re.search(r"^\s*\\\\[0-9a-zA-Z._-]+\\([$\w\-\.]+)", line)
+        m = re.search(r"^\\s*\\\\\\\\[0-9a-zA-Z._-]+\\\\([$\\w\\-\\.]+)", line)
         if m: shares.add(m.group(1))
-        m2 = re.search(r"^\s*Sharename\s+Type.*", line, re.I)
-    # also parse smbmap lines: | Share | R | W |
-    for m in re.finditer(r"\|\s*([$\w\-.]+)\s*\|\s*(R?)[\s\|]*(W?)\s*\|", txt):
+        re.search(r"^\\s*Sharename\\s+Type.*", line, re.I)
+    for m in re.finditer(r"\\|\\s*([$\\w\\-.]+)\\s*\\|\\s*(R?)[\\s\\|]*(W?)\\s*\\|", txt):
         shares.add(m.group(1))
-    # drop administrative $
     return [s for s in shares if not s.endswith("$")]
 
 def nfs_exports(nfs_dir):
     txt = read_text(Path(nfs_dir)/"exports.txt")
     ex=[]
     for line in txt.splitlines():
-        m = re.match(r"^\s*([/\w\-.]+)\s+", line)
+        m = re.match(r"^\\s*([/\\w\\-.]+)\\s+", line)
         if m and m.group(1)!="/":
             ex.append(m.group(1))
     return ex
 
 def ldap_naming_contexts(ldap_dir):
     txt = read_text(Path(ldap_dir)/"ldap_base.txt")
-    ncs = re.findall(r"namingcontexts:\s*([^\r\n]+)", txt, flags=re.I)
+    ncs = re.findall(r"namingcontexts:\\s*([^\\r\\n]+)", txt, flags=re.I)
     return [x.strip() for x in ncs]
 
 def redis_info_has_auth(redis_dir):
-    txt = read_text(Path(redis_dir)/"info.txt") + "\n" + read_text(Path(redis_dir)/"config.txt")
-    # If AUTH not required, many INFO fields return; we just propose safe follow-ups (dbsize, keyspace sample)
+    txt = read_text(Path(redis_dir)/"info.txt") + "\\n" + read_text(Path(redis_dir)/"config.txt")
     return "requirepass" not in txt.lower()
 
 # =================== Follow-up Executors ===================
@@ -925,7 +1077,7 @@ def http_fetch(ip, port, path, outdir, timebox=None, scheme="http"):
     d = Path(outdir)/f"http_{ip}_{port}"/"followups"; d.mkdir(parents=True, exist_ok=True)
     url = f"{scheme}://{ip}:{port}{path}"
     if which("curl"):
-        run(["curl","-iL","--max-time","15",url], d/f"fetch_{path.strip('/').replace('/','_')}.txt", hard_timeout=timebox)
+        run(["curl","-iL","-k","--max-time","15",url], d/f"fetch_{path.strip('/').replace('/','_')}.txt", hard_timeout=timebox)
 
 def smb_list_share(ip, share, outdir, timebox=None):
     d = Path(outdir)/"smb"/"followups"; d.mkdir(parents=True, exist_ok=True)
@@ -933,14 +1085,16 @@ def smb_list_share(ip, share, outdir, timebox=None):
         run(["smbclient","-N",f"//{ip}/{share}","-c","recurse ON; ls"], d/f"ls_{share}.txt", hard_timeout=timebox)
 
 def nfs_mount_and_ls(ip, export, outdir, timebox=None):
-    if not (which("mount") and which("umount")): return
+    if not (which("mount")): return
     mount_root = Path(outdir)/"nfs"/"followups"; mount_root.mkdir(parents=True, exist_ok=True)
     tmpdir = tempfile.mkdtemp(prefix="nfs_", dir=mount_root)
     try:
-        run(["mount","-t","nfs",f"{ip}:{export}", tmpdir], mount_root/"mount.log", hard_timeout=timebox)
+        cmd_mount = _sudo_prefix() + ["mount","-t","nfs",f"{ip}:{export}", tmpdir]
+        run(cmd_mount, mount_root/"mount.log", hard_timeout=timebox)
         run(["ls","-laR", tmpdir], Path(tmpdir)/"ls.txt", hard_timeout=timebox)
     finally:
-        run(["umount", tmpdir], mount_root/"umount.log", hard_timeout=timebox)
+        cmd_umount = _sudo_prefix() + ["umount", tmpdir]
+        run(cmd_umount, mount_root/"umount.log", hard_timeout=timebox)
 
 def ldap_base_search(ip, naming_context, outdir, timebox=None):
     d = Path(outdir)/"ldap"/"followups"; d.mkdir(parents=True, exist_ok=True)
@@ -986,7 +1140,6 @@ def parse_services_from_nmap_xml(xml_path: str):
 
                 http_title = ""
                 http_server = ""
-                # script children exist for http-title/http-server-header (nmap xml)
                 for s in p.findall("script"):
                     sid = s.get("id") or ""
                     out = (s.get("output") or "").strip()
@@ -1003,10 +1156,9 @@ def parse_services_from_nmap_xml(xml_path: str):
                 }
                 infos.append(rec)
 
-                # build keywords/tokens from product/name/http fields
                 keys = set()
                 def add_tokens(s, minlen=2):
-                    for tok in re.split(r"[^a-z0-9\.]+", (s or "").lower()):
+                    for tok in re.split(r"[^a-z0-9\\.]+", (s or "").lower()):
                         tok = tok.strip()
                         if tok and len(tok) >= minlen and not tok.isnumeric():
                             keys.add(tok)
@@ -1021,57 +1173,25 @@ def parse_services_from_nmap_xml(xml_path: str):
 
     return infos, kw_index
     
-def _annotate_with_service(exploit_title: str, kw_index: dict):
-    """
-    Try to find a service record that matches this exploit title via keyword match.
-    Returns (service_label, version, http_title, http_server)
-    """
-    t = exploit_title.lower()
-    best = None
-    for kw, recs in kw_index.items():
-        if kw and kw in t:
-            # choose the first record for now (usually fine)
-            best = recs[0]
-            break
-    if not best:
-        return "", "", "", ""
-    # human service label
-    svc = best.get("product") or best.get("name") or ""
-    ver = best.get("version") or best.get("extrainfo") or ""
-    # http extras only make sense for HTTP(S)
-    http_title = best.get("http_title") if best.get("name","").startswith("http") or best.get("product","").lower().startswith(("apache","nginx","gunicorn","iis","lighttpd")) else ""
-    http_server = best.get("http_server") if http_title or ("http" in (best.get("name",""))) else ""
-    return svc, ver, http_title, http_server
-
 def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
     """
-    Improved searchsploit runner:
-      - extracts keywords from Nmap XML (service/product/http-title/http-server)
-      - queries searchsploit per-keyword (de-dupes)
-      - writes:
-         exploits/searchsploit_from_nmap.txt (raw concatenation of runs)
-         exploits/searchsploit_from_nmap.tsv (Service,Version,HTTP_Title,HTTP_Server,Keyword,Title,URL,EDB_ID)
+    Keyword-driven searchsploit, output TSV for version-matched exploits
     """
     exp_dir = ip_dir / "exploits"
     exp_dir.mkdir(parents=True, exist_ok=True)
     txt_out = exp_dir / "searchsploit_from_nmap.txt"
     tsv_out = exp_dir / "searchsploit_from_nmap.tsv"
 
-    # parse nmap xml for context
     svc_infos, kw_index = parse_services_from_nmap_xml(nmap_xml_path)
 
-    # ensure searchsploit present
     if not which("searchsploit"):
         txt_out.write_text("searchsploit not installed.\n", encoding="utf-8")
         with open(tsv_out, "w", encoding="utf-8") as f:
             f.write("Service\tVersion\tHTTP_Title\tHTTP_Server\tKeyword\tTitle\tURL\tEDB_ID\n")
         return str(txt_out), str(tsv_out)
 
-    # ---------- build keys (strong-token filtering) ----------
-    MAX_KEYWORDS = 12
     GENERIC_BLACKLIST = {
-        "http","https","ssh","tcp","udp","server","service","open","port",
-        "www","httpserver","web"  # keep apache/nginx if you want; remove them from blacklist
+        "http","https","ssh","tcp","udp","server","service","open","port","www","httpserver","web"
     }
 
     kw_strength = {}
@@ -1080,7 +1200,6 @@ def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
             continue
         if kw in GENERIC_BLACKLIST:
             continue
-        # strong if any rec has product/version/http hints
         strong = False
         for r in recs:
             if (r.get("product") and r["product"].strip()) or (r.get("version") and r["version"].strip()) \
@@ -1090,20 +1209,12 @@ def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
         kw_strength[kw] = (len(recs), strong)
 
     sorted_kw = sorted(kw_strength.items(), key=lambda x: (0 if x[1][1] else 1, -x[1][0], -len(x[0])))
-
-    kws = []
-    for kw, (count, strong) in sorted_kw:
-        if strong:
-            kws.append(kw)
-        if len(kws) >= MAX_KEYWORDS:
-            break
-
-    # guarded fallback (only if no strong tokens)
+    MAX_KEYWORDS = 12
+    kws = [kw for kw, (count, strong) in sorted_kw if strong][:MAX_KEYWORDS]
     if not kws:
-        # prefer product-like tokens from svc_infos
         for rec in svc_infos:
             for candidate in (rec.get("product") or "", rec.get("name") or "", rec.get("http_title") or ""):
-                for tok in re.split(r"[^a-z0-9\.]+", candidate.lower()):
+                for tok in re.split(r"[^a-z0-9\\.]+", candidate.lower()):
                     tok = tok.strip()
                     if tok and len(tok) > 3 and tok not in kws and tok not in GENERIC_BLACKLIST:
                         kws.append(tok)
@@ -1113,22 +1224,19 @@ def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
                     break
             if len(kws) >= min(4, MAX_KEYWORDS):
                 break
-    # final safety: if still empty use small safe set
     if not kws:
         kws = ["nginx","apache","gunicorn","uvicorn"]
 
-    # ---------- run searchsploit per keyword and aggregate ----------
-    url_re = re.compile(r"(https?://(?:www\.)?exploit-db\.com/[^\s]+)", re.I)
-    edb_re = re.compile(r"/exploits/(\d+)", re.I)
+    url_re = re.compile(r"(https?://(?:www\\.)?exploit-db\\.com/[^\\s]+)", re.I)
+    edb_re = re.compile(r"/exploits/(\\d+)", re.I)
 
-    aggregated = {}  # url -> (title, edb, keyword, svc_name, svc_ver, http_title, http_server)
+    aggregated = {}
 
-    # write raw concatenated log
     with open(txt_out, "w", encoding="utf-8", errors="ignore") as rawf:
         for kw in kws:
-            rawf.write(f"--- searchsploit: {kw} ---\n")
-            out, _ = run(["searchsploit", kw, "-w"], None)   # capture output; use -w to get URL columns when available
-            rawf.write(out + "\n\n")
+            rawf.write(f"--- searchsploit: {kw} ---\\n")
+            out, _ = run(["searchsploit", kw, "-w"], None)
+            rawf.write(out + "\\n\\n")
             for raw_line in out.splitlines():
                 line = strip_ansi(raw_line).strip()
                 if not line:
@@ -1142,7 +1250,7 @@ def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
                 title = line[:m.start()].strip()
                 if " | " in title:
                     title = title.split(" | ")[0].strip()
-                # find service context: prefer kw_index match, else best-effort search in svc_infos
+
                 svc_rec = None
                 if kw in kw_index and kw_index[kw]:
                     svc_rec = kw_index[kw][0]
@@ -1160,11 +1268,9 @@ def run_searchsploit_from_nmap(ip_dir: Path, nmap_xml_path: str):
                 if url not in aggregated:
                     aggregated[url] = (title, edb, kw, svc_name, svc_ver, http_title, http_server)
 
-    # ---------- write TSV ----------
     with open(tsv_out, "w", encoding="utf-8") as f:
         f.write("Service\tVersion\tHTTP_Title\tHTTP_Server\tKeyword\tTitle\tURL\tEDB_ID\n")
         for url, (title, edb, kw, svc_name, svc_ver, htitle, hserver) in aggregated.items():
-            # keep TSV raw (no escaping) — HTML rendering will escape later
             f.write(
                 f"{svc_name}\t{svc_ver}\t{htitle}\t{hserver}\t{kw}\t{title}\t{url}\t{edb}\n"
             )
@@ -1246,13 +1352,11 @@ def enumerate_target(ip, args):
                 if state: mark_task(state, f"smtp:{p}:banner", "done", out)
     note(f"[+] Per-service enumeration completed in {elapsed_str(stage_start)}")
 
-    # Auto follow-up phase
+    # Auto follow-up phase (wire as you prefer; left minimal here)
     stage_start = time.time()
     with spinner("Running auto follow-up tasks"):
         if state:
             fanout = state["settings"].get("followup_fanout", 3)
-            # (keep your existing follow-up logic unchanged here)
-            # ...
             generate_mermaid_mindmap(ip_dir, ip, state)
             generate_next_steps(ip_dir, state, args.timebox)
             save_plan(ip_dir, state)
@@ -1263,11 +1367,11 @@ def enumerate_target(ip, args):
     note(f"[✓] Total elapsed time for {ip}: {total_elapsed}")
     summary = Path(ip_dir)/"SUMMARY.txt"
     with open(summary,"w") as f:
-        f.write(f"AutoEnum Summary for {ip} @ {datetime.now().isoformat(timespec='seconds')}\n")
-        f.write(f"Total elapsed time: {total_elapsed}\n\n")
-        f.write("Open TCP ports:\n")
+        f.write(f"AutoEnum Summary for {ip} @ {datetime.now().isoformat(timespec='seconds')}\\n")
+        f.write(f"Total elapsed time: {total_elapsed}\\n\\n")
+        f.write("Open TCP ports:\\n")
         for p, svc in sorted({p:svc for (p,proto),svc in open_services.items() if proto=='tcp'}.items()):
-            f.write(f"  - {p}/tcp : {svc}\n")
+            f.write(f"  - {p}/tcp : {svc}\\n")
 
     note(f"Done. Summary: {summary}")
     generate_html_report(ip_dir, ip, state, port_summary=open_services)
@@ -1275,12 +1379,12 @@ def enumerate_target(ip, args):
 # =================== CLI ===================
 
 def main():
-    ap = argparse.ArgumentParser(description="OSCP-friendly auto enumeration with planner + auto follow-ups.")
+    ap = argparse.ArgumentParser(description="OSCP-friendly auto enumeration with planner + streamlined report.")
     ap.add_argument("targets", nargs="+", help="Target IP(s) or hostnames")
     ap.add_argument("-o","--out", default="enum_out", help="Output directory")
     ap.add_argument("--timing", default="T4", choices=["T0","T1","T2","T3","T4","T5"])
     ap.add_argument("--no-ping", action="store_true", help="Use -Pn")
-    ap.add_argument("--udp-top", type=int, default=200, help="UDP top-N (0=off)")
+    ap.add_argument("--udp-top", type=int, default=200, help="UDP top-N (0=off => SNMP trio)")
     ap.add_argument("-w","--wordlist", default=None)
     ap.add_argument("-t","--threads", type=int, default=30)
     ap.add_argument("--planner", action="store_true", help="Enable mindmap + task queue")
