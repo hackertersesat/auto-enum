@@ -300,6 +300,18 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
         mm_src = "mindmap\n  root((No planner data))\n    note(Add --planner)\n"
 
     artifacts = _collect_artifacts(ip_dir, ip)
+    # Defensive fallback so the page isn't empty
+    if not artifacts:
+        nmap_dir = ip_dir / "nmap"
+        if nmap_dir.exists():
+            files = []
+            for p in sorted(nmap_dir.glob("*.nmap")):
+                size, mtime = _file_info(p)
+                rel = p.relative_to(ip_dir)
+                files.append({"path": p, "rel": str(rel).replace("\\","/"), "name": p.name, "size": size, "mtime": mtime, "is_followup": False})
+            if files:
+                artifacts = [{"folder": "nmap", "files": files}]
+
     
     # Build follow-ups (non-empty only), for the top table (kept minimal)
     followups = []
@@ -741,6 +753,33 @@ def parse_open_services(gnmap_file):
                         pass
     return d
 
+def parse_open_services_xml(xml_file):
+    """
+    Robust fallback: parse open ports from Nmap XML.
+    Returns {(port, proto): service_name}
+    """
+    out = {}
+    try:
+        if not xml_file or not Path(xml_file).exists():
+            return out
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        for host in root.findall("host"):
+            for ports in host.findall("ports"):
+                for p in ports.findall("port"):
+                    state = p.find("state")
+                    if state is None or state.get("state") != "open":
+                        continue
+                    proto = p.get("protocol", "tcp")
+                    portid = int(p.get("portid") or 0)
+                    svc_el = p.find("service")
+                    name = (svc_el.get("name") if svc_el is not None else "") or ""
+                    out[(portid, proto)] = name
+        return out
+    except Exception:
+        return out
+
+
 # =================== Planner / Tasks ===================
 
 def score_task(service, port, tactic):
@@ -918,14 +957,55 @@ def http_enum(ip, port, outdir, wordlist, threads, scheme_hint=None, timebox=Non
     if which("whatweb"):
         _,dt = run(["whatweb", "--color=never", "-a","3", base], d/"whatweb.txt", hard_timeout=timebox); out.append(f"whatweb:{dt}s")
     if which("dirsearch"):
+        # 1) run dirsearch quietly and without color
+        #    (v0.4.x supports -q; newer also accept --quiet)
+        ds_cmd = [
+            "dirsearch",
+            "-u", base,
+            "-t", str(threads),
+            "--format", "plain",
+            "-o", "autoenum",        # dirsearch will write a results file ("Output File: ...")
+            "-q",                    # quiet console
+            "--no-color",
+        ]
+
+        # capture console, but don't write it yet
+        raw_out, dt = run(ds_cmd, None, hard_timeout=timebox)
+
+        # 2) extract the path of dirsearch's results file
+        m = re.search(r"Output File:\s*(/[^ \t\r\n]+)", raw_out)
+        ds_report = Path(m.group(1).strip()) if m else None
+
+        # 3) write a *clean* log: only "Output File:" + the hit lines
         log_path = d / "dirsearch.log"
-        _, dt = run(
-            ["dirsearch", "-u", base, "-t", str(threads), "--format", "plain", "-o", "autoenum"],
-            log_path,
-            hard_timeout=timebox
-        )
+        keep_lines = []
+
+        # keep the Output File line if present
+        if m:
+            keep_lines.append(m.group(0))
+
+        # include the top hits directly from the report file (if it exists)
+        # plain format has lines like: "403 - 980B - /path"
+        if ds_report and ds_report.exists():
+            try:
+                txt = ds_report.read_text(encoding="utf-8", errors="ignore")
+                for ln in txt.splitlines():
+                    if re.search(r"^\s*\d{3}\s+-\s+", ln):
+                        keep_lines.append(ln)
+            except Exception:
+                pass
+        else:
+            # fallback: filter console output for the hit lines only
+            for ln in raw_out.splitlines():
+                # console format: "[00:17:38] 403 -  980B  - /path"
+                if ln.startswith("Output File:") or re.search(r"^\[\d{2}:\d{2}:\d{2}\]\s+\d{3}\s+-\s+", ln):
+                    keep_lines.append(ln)
+
+        # write the trimmed log
+        log_path.write_text("\n".join(keep_lines) + "\n", encoding="utf-8")
+
         out.append(f"dirsearch:{dt}s")
-        # We no longer try to copy the report; HTML renderer will resolve it from reports dir
+    
     # content discovery
     if which("feroxbuster"):
         _,dt = run(["feroxbuster","-u",base,"-n","-t",str(threads),"-q"], d/"feroxbuster.txt", hard_timeout=timebox); out.append(f"ferox:{dt}s")
@@ -1292,23 +1372,36 @@ def enumerate_target(ip, args):
         state["settings"]["timebox_min"] = args.timebox
         save_plan(ip_dir, state)
 
-    # Nmap
+    # ==== Nmap ====
     stage_start = time.time()
     with spinner("Running Nmap scans"):
         scans = nmap_stage_scans(ip, ip_dir, timing=args.timing, disable_ping=args.no_ping, udp_top=args.udp_top)
     note(f"[+] Nmap scan completed in {elapsed_str(stage_start)}")
 
-    # Searchsploit
+    # ==== Searchsploit ====
     stage_start = time.time()
     with spinner("Running Searchsploit lookups"):
         ssp_txt, ssp_tsv = run_searchsploit_from_nmap(ip_dir, scans.get("all_xml"))
     note(f"[+] Searchsploit completed in {elapsed_str(stage_start)}")
 
-    # Parse open ports
+    # ==== Parse open ports (PUT THIS DIRECTLY BELOW THE NMAP/SEARCHSPLOIT BLOCKS) ====
+    # Parse open ports with XML fallback (more robust)
     open_services = {}
-    for k in ("all","top","udp"): 
-        open_services.update(parse_open_services(scans.get(k)))
 
+    for k in ("all", "top", "udp"):
+        path = scans.get(k)
+        if path:                              # be defensive
+            open_services.update(parse_open_services(path))
+
+    # If gnmap parsing yielded nothing, fall back to XML
+    if not open_services:
+        all_xml = scans.get("all_xml")
+        udp_xml = scans.get("udp_xml")
+        if all_xml:
+            open_services.update(parse_open_services_xml(all_xml))
+        if udp_xml:
+            open_services.update(parse_open_services_xml(udp_xml))
+            
     # seed planner tasks
     if state:
         enqueue_tasks_from_services(state, open_services)
