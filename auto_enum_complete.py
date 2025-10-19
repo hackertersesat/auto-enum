@@ -526,7 +526,7 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
                     if name_lower == "whatweb.txt":
                         lines = [ln for ln in text.splitlines() if ln.strip()]
                         text = "\\n".join(lines[:120])
-                    	body_html = f"<pre>{_escape(text)}</pre>"
+                        body_html = f"<pre>{_escape(text)}</pre>"
                     if name_lower == "whatweb.txt":
                         lines = [ln for ln in text.splitlines() if ln.strip()]
                         text = "\n".join(lines[:120])
