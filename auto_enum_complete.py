@@ -508,7 +508,7 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
 """)
 
             # Now embed a small set of local files
-            keep_names = {"whatweb.txt", "curl-headers.txt", "nmap-http-scripts.txt"}
+            keep_names = {"whatweb.txt", "curl-headers.txt", "nmap-http-scripts.txt","dirsearch.log","feroxbuster.txt"}
             for f in sec["files"]:
                 name_lower = f["name"].lower()
                 if name_lower not in keep_names:
@@ -526,7 +526,19 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
                     if name_lower == "whatweb.txt":
                         lines = [ln for ln in text.splitlines() if ln.strip()]
                         text = "\\n".join(lines[:120])
-                    body_html = f"<pre>{_escape(text)}</pre>"
+                    	body_html = f"<pre>{_escape(text)}</pre>"
+                    if name_lower == "whatweb.txt":
+                        lines = [ln for ln in text.splitlines() if ln.strip()]
+                        text = "\n".join(lines[:120])
+                        body_html = f"<pre>{_escape(text)}</pre>"
+                    elif name_lower == "dirsearch.log":
+                        # dirsearch.log already has 'Output File:' and trimmed hits; show it directly
+                        body_html = f"<pre>{_escape(text)}</pre>"
+                    elif name_lower in ("feroxbuster.txt"):
+                        # these can be long; only preview the first 500 lines
+                        lines = text.splitlines()
+                        body_html = "<pre>" + _escape("\n".join(lines[:500]) or "(no findings)") + "</pre>"
+                    
                     if truncated:
                         body_html = f"<div class='muted'>(preview truncated to 200 KB)</div>" + body_html
 
