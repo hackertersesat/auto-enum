@@ -167,20 +167,39 @@ def _is_probably_text(path: Path) -> bool:
     except Exception:
         return False
 
-def _read_text_for_embed(path: Path, max_bytes: int = 200*1024):
+def _read_text_for_embed(path: Path, max_bytes: int = 200_000) -> tuple[str, bool]:
+    """Read text file safely for embedding, cleaning ANSI/byte artifacts."""
     try:
         raw = path.read_bytes()
-    except Exception:
-        return "(error reading file)", False
-    truncated = False
-    if len(raw) > max_bytes:
+    except Exception as e:
+        return f"[!] Error reading file: {e}", False
+
+    truncated = len(raw) > max_bytes
+    if truncated:
         raw = raw[:max_bytes]
-        truncated = True
-    try:
-        text = raw.decode("utf-8", errors="replace")
-    except Exception:
-        text = raw.decode("latin-1", errors="replace")
-    return strip_ansi(text), truncated
+
+    text = raw.decode("utf-8", "replace")
+
+    # --- Fix for enum4linux & other tools producing 'b'...' style byte repr ---
+    if text.startswith(("b'", 'b"')) and (text.endswith("'") or text.endswith('"')):
+        text = text[2:-1]
+
+    # Decode literal escape sequences like \n, \t, \x1b etc.
+    if "\\x1b" in text or "\\n" in text or "\\t" in text:
+        try:
+            text = bytes(text, "utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+
+    # Remove ANSI color codes and control characters
+    import re
+    ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    text = ANSI_ESCAPE.sub("", text)
+
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    return text, truncated
 
 def _escape(s): return _html.escape(s, quote=True)
 
