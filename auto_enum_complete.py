@@ -11,6 +11,7 @@ import threading
 import itertools
 import contextlib
 import re
+import shlex
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -105,7 +106,8 @@ _ALLOWED_FILES = {
     "nmap":      (lambda p: p.suffix == ".nmap"),  # only .nmap
     "smb":       (lambda p: p.name in {"smbmap_anonymous.txt", "enum4linux-ng.txt", "enum4linux.txt", "smbclient_list.txt"}),
     "ftp":       (lambda p: p.name in {"anonymous_list.txt", "nmap-ftp-scripts.txt"}),
-    "ldap":      (lambda p: p.name in {"ldap_base.txt"}),
+#    "ldap":      (lambda p: p.name in {"ldap_base.txt"}),
+    "ldap":      (lambda p: p.name.startswith("ldap_") or p.name == "ldap_base.txt" or p.name == "ldap_namingcontexts.txt"),
     "nfs":       (lambda p: p.name in {"exports.txt"}),
     "redis":     (lambda p: p.name in {"info.txt", "config.txt"}),
     "rpc":       (lambda p: p.name in {"rpcinfo.txt"}),
@@ -200,6 +202,80 @@ def _read_text_for_embed(path: Path, max_bytes: int = 200_000) -> tuple[str, boo
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     return text, truncated
+
+def _safe_fn(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:160] if len(s) > 160 else s
+
+def _run_cmd_capture(cmd, timeout: int = 60):
+    """Run a shell command (string or list). Return (rc, stdout_text, stderr_text)."""
+    try:
+        if isinstance(cmd, (list, tuple)):
+            cmd_display = " ".join(cmd)
+        else:
+            cmd_display = str(cmd)
+        # run as shell if string; allow list for direct exec
+        proc = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, timeout=timeout)
+        out = (proc.stdout or b"").decode("utf-8", "replace")
+        err = (proc.stderr or b"").decode("utf-8", "replace")
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        return -1, "", f"[!] Timeout after {timeout}s"
+    except Exception as e:
+        return -2, "", f"[!] Exception: {e}"
+
+def ldap_enumerate_for_target(ip: str, outdir: Path, timeout: int = 60, base_dn_hint: str = "") -> list[Path]:
+    """
+    Perform LDAP enumeration in two steps:
+      1. Discover namingContexts (rootDSE query)
+      2. Enumerate each namingContext with (objectclass=*)
+    """
+    d = Path(outdir) / "ldap"
+    d.mkdir(parents=True, exist_ok=True)
+    results = []
+
+    # Step 1: Discover namingContexts
+    cmd_discovery = f'ldapsearch -H ldap://{ip} -x -s base namingcontexts'
+    rc, out_discovery, err_discovery = _run_cmd_capture(cmd_discovery, timeout=timeout)
+
+    naming_file = d / "ldap_namingcontexts.txt"
+    with open(naming_file, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write(f"# Command: {cmd_discovery}\n")
+        fh.write(out_discovery if out_discovery else "")
+        if err_discovery:
+            fh.write("\n# STDERR:\n")
+            fh.write(err_discovery)
+    results.append(naming_file)
+
+    # Parse namingContexts lines (e.g., namingcontexts: DC=hutch,DC=offsec)
+    namingcontexts = []
+    for ln in out_discovery.splitlines():
+        ln = ln.strip()
+        if ln.lower().startswith("namingcontexts:"):
+            dn = ln.split(":", 1)[1].strip()
+            if dn and dn not in namingcontexts:
+                namingcontexts.append(dn)
+
+    # Optionally include user-provided hint if no namingContexts found
+    if not namingcontexts and base_dn_hint:
+        namingcontexts.append(base_dn_hint)
+
+    # Step 2: Enumerate each namingContext
+    for nc in namingcontexts:
+        safe = _safe_fn(nc)
+        cmd_enum = f'ldapsearch -H ldap://{ip} -v -x -b "{nc}" "(objectclass=*)"'
+        rc, out_enum, err_enum = _run_cmd_capture(cmd_enum, timeout=timeout * 3)
+        fn = d / f"ldap_{safe}.txt"
+        with open(fn, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"# Command: {cmd_enum}\n")
+            fh.write(out_enum if out_enum else "")
+            if err_enum:
+                fh.write("\n# STDERR:\n")
+                fh.write(err_enum)
+        results.append(fn)
+
+    return results
 
 def _escape(s): return _html.escape(s, quote=True)
 
@@ -1075,11 +1151,19 @@ def ftp_enum(ip, outdir, timebox=None):
     return "; ".join(out) or "ftp:skipped"
 
 def ldap_enum(ip, outdir, timebox=None):
-    d = Path(outdir)/"ldap"; d.mkdir(parents=True, exist_ok=True)
-    out=[]
-    if which("ldapsearch"):
-        _,dt = run(["ldapsearch","-x","-H",f"ldap://{ip}","-s","base","namingcontexts"], d/"ldap_base.txt", hard_timeout=timebox); out.append(f"ldap-base:{dt}s")
-    return "; ".join(out) or "ldap:skipped"
+    """
+    Wrapper used by per-service enumeration loop.
+    Calls ldap_enumerate_for_target and returns a short status string.
+    """
+    d = Path(outdir)  # ldap_enumerate_for_target will create d/ldap
+    if not which("ldapsearch"):
+        return "ldap:ldapsearch-not-found"
+    try:
+        files = ldap_enumerate_for_target(ip, d, timeout=(timebox or 1)*60 if timebox else 60)
+        return "ldap:" + ",".join(f.name for f in files)
+    except Exception as e:
+        warn(f"ldap_enum failed for {ip}: {e}")
+        return "ldap:error"
 
 def nfs_enum(ip, outdir, timebox=None):
     d = Path(outdir)/"nfs"; d.mkdir(parents=True, exist_ok=True)
@@ -1174,7 +1258,8 @@ def nfs_exports(nfs_dir):
     return ex
 
 def ldap_naming_contexts(ldap_dir):
-    txt = read_text(Path(ldap_dir)/"ldap_base.txt")
+    # prefer namingcontexts file
+    txt = read_text(Path(ldap_dir)/"ldap_namingcontexts.txt") or read_text(Path(ldap_dir)/"ldap_base.txt")
     ncs = re.findall(r"namingcontexts:\\s*([^\\r\\n]+)", txt, flags=re.I)
     return [x.strip() for x in ncs]
 
