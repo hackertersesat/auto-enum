@@ -1136,7 +1136,7 @@ def smb_enum(ip, outdir, timebox=None):
     if which("enum4linux-ng"):
         _,dt = run(["enum4linux-ng","-A",ip], d/"enum4linux-ng.txt", hard_timeout=timebox); out.append(f"e4l-ng:{dt}s")
     elif which("enum4linux"):
-        _,dt = run(["enum4linux","-a",ip], d/"enum4linux.txt", hard_timeout=timebox); out.append(f"e4l:{dt}s")
+        _,dt = run(["enum4linux","-u anonymous","-p anonymous","-a",ip], d/"enum4linux.txt", hard_timeout=timebox); out.append(f"e4l:{dt}s")
     if which("smbmap"):
         _,dt = run(["smbmap","-H",ip], d/"smbmap_anonymous.txt", hard_timeout=timebox); out.append(f"smbmap:{dt}s")
     return "; ".join(out) or "smb:skipped"
