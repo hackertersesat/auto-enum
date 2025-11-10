@@ -549,6 +549,22 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
         if not sec["files"]:
             continue
         blocks = []
+        # If there's a per-section COMMANDS.txt, embed it at the top
+        try:
+            from pathlib import Path as _Path
+            _cmd_path = _Path(ip_dir) / sec["folder"] / "COMMANDS.txt"
+            if _cmd_path.exists():
+                _cmd_text, _tr = _read_text_for_embed(_cmd_path)
+                blocks.append(
+                    f"""
+<div class='card'>
+  <h3>Commands run</h3>
+  <pre>{_escape(_cmd_text)}</pre>
+</div>
+"""
+                )
+        except Exception:
+            pass
         
         # If this is an http_ folder, add quick launch links
         launch_html = ""
@@ -603,7 +619,7 @@ def generate_html_report(ip_dir: Path, ip: str, state: dict | None, port_summary
 """)
 
             # Now embed a small set of local files
-            keep_names = {"whatweb.txt", "curl-headers.txt", "nmap-http-scripts.txt","dirsearch.log","feroxbuster.txt"}
+            keep_names = {"whatweb.txt", "curl-headers.txt", "nmap-http-scripts.txt","dirsearch.log","feroxbuster.txt","COMMANDS.txt"}
             for f in sec["files"]:
                 name_lower = f["name"].lower()
                 if name_lower not in keep_names:
