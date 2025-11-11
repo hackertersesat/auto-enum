@@ -803,10 +803,7 @@ def run(cmd, outfile=None, cwd=None, hard_timeout=None):
                         cmd_display = " ".join(str(c) for c in cmd)
                 else:
                     cmd_display = str(cmd)
-                header = f"# Command: {cmd_display}
-# When: {datetime.now(timezone.utc).isoformat()}
-
-"
+                header = f"# Command: {cmd_display}\\n# When: {datetime.now(timezone.utc).isoformat()}\\n\\n"
                 with open(out_path, "w", encoding="utf-8", errors="ignore") as f:
                     f.write(header + (out or ""))
                 # Append to per-section COMMANDS.txt
