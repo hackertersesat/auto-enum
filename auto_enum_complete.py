@@ -809,8 +809,7 @@ def run(cmd, outfile=None, cwd=None, hard_timeout=None):
                 # Append to per-section COMMANDS.txt
                 try:
                     with open(out_path.parent / "COMMANDS.txt", "a", encoding="utf-8", errors="ignore") as cmdf:
-                        cmdf.write(f"{datetime.now(timezone.utc).isoformat()}	{cmd_display}
-")
+                        cmdf.write(f"{datetime.now(timezone.utc).isoformat()}	{cmd_display}")
                 except Exception:
                     pass
             except Exception:
