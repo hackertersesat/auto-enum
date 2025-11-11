@@ -792,9 +792,30 @@ def run(cmd, outfile=None, cwd=None, hard_timeout=None):
         # Write output to file if requested
         if outfile:
             try:
-                Path(outfile).parent.mkdir(parents=True, exist_ok=True)
-                with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
-                    f.write(out)
+                out_path = Path(outfile)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime, timezone
+                if isinstance(cmd, (list, tuple)):
+                    try:
+                        import shlex
+                        cmd_display = shlex.join(cmd)
+                    except Exception:
+                        cmd_display = " ".join(str(c) for c in cmd)
+                else:
+                    cmd_display = str(cmd)
+                header = f"# Command: {cmd_display}
+# When: {datetime.now(timezone.utc).isoformat()}
+
+"
+                with open(out_path, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(header + (out or ""))
+                # Append to per-section COMMANDS.txt
+                try:
+                    with open(out_path.parent / "COMMANDS.txt", "a", encoding="utf-8", errors="ignore") as cmdf:
+                        cmdf.write(f"{datetime.now(timezone.utc).isoformat()}	{cmd_display}
+")
+                except Exception:
+                    pass
             except Exception:
                 pass
 
